@@ -7,15 +7,17 @@ import copy
 import csv
 import io
 import os
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from typing import Callable, List, Optional
 from uuid import uuid4
 
 from loguru import logger
 
+from app.models import const
 from app.models.schema import VideoParams
 from app.services import llm
+from app.services import state as sm
 from app.services import task as tm
 from app.services import video as vd
 from app.utils import utils
@@ -202,3 +204,82 @@ def run_batch(
     success = sum(1 for r in results if r.status == STATUS_SUCCESS)
     logger.success(f"batch {batch_id} finished: {success}/{total} succeeded, results: {csv_file}")
     return {"batch_id": batch_id, "results": results, "csv_file": csv_file}
+
+
+def _result_dicts(results: List[BatchResult]) -> List[dict]:
+    # 只保存基础类型（字符串、数字、列表、字典），兼容 Redis 状态存储
+    return [asdict(r) for r in results]
+
+
+def run_batch_task(
+    task_id: str,
+    items: List[BatchItem],
+    base_params: VideoParams,
+    merge_videos: bool = False,
+    merge_transition: str = "none",
+):
+    """API 后台任务：批量生成视频，并把进度和结果写入任务状态（GET /tasks/{task_id} 可查询）。"""
+    total = len(items)
+    sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=0, total=total)
+    collected: List[BatchResult] = []
+
+    def on_progress(done, _total, result):
+        collected.append(result)
+        sm.state.update_task(
+            task_id,
+            state=const.TASK_STATE_PROCESSING,
+            # 合并合集视频还需要时间，因此逐个视频阶段最多显示 95%
+            progress=int(done / total * (95 if merge_videos else 99)),
+            total=total,
+            results=_result_dicts(collected),
+        )
+
+    try:
+        output = run_batch(items, base_params, batch_id=task_id, on_progress=on_progress)
+        results = output["results"]
+        videos = [v for r in results if r.status == STATUS_SUCCESS for v in r.videos]
+        extra = {}
+        if merge_videos and videos:
+            merged_file = os.path.join(utils.task_dir(task_id), "tong_hop.mp4")
+            try:
+                extra["merged_video"] = merge_batch_videos(results, merged_file, merge_transition)
+            except Exception as e:
+                logger.exception(f"batch {task_id}: failed to merge videos")
+                extra["merge_error"] = str(e)[-500:]
+        sm.state.update_task(
+            task_id,
+            state=const.TASK_STATE_COMPLETE if videos else const.TASK_STATE_FAILED,
+            progress=100,
+            total=total,
+            success=len([r for r in results if r.status == STATUS_SUCCESS]),
+            results=_result_dicts(results),
+            videos=videos,
+            csv_file=output["csv_file"],
+            **extra,
+        )
+    except Exception as e:
+        logger.exception(f"batch task {task_id} failed")
+        sm.state.update_task(
+            task_id,
+            state=const.TASK_STATE_FAILED,
+            progress=100,
+            total=total,
+            results=_result_dicts(collected),
+            error=str(e)[-500:],
+        )
+
+
+def run_merge_task(task_id: str, files: List[str], transition: str = "none"):
+    """API 后台任务：把多个视频合并为一个，结果写入任务状态。"""
+    sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=0)
+    try:
+        output_file = os.path.join(utils.task_dir(task_id), "tong_hop.mp4")
+        vd.merge_video_files(files, output_file, transition=transition)
+        sm.state.update_task(
+            task_id, state=const.TASK_STATE_COMPLETE, progress=100, videos=[output_file]
+        )
+    except Exception as e:
+        logger.exception(f"merge task {task_id} failed")
+        sm.state.update_task(
+            task_id, state=const.TASK_STATE_FAILED, progress=100, error=str(e)[-500:]
+        )

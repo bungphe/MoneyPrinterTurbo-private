@@ -1,6 +1,6 @@
 import warnings
 from enum import Enum
-from typing import Any, List, Optional, Union
+from typing import Any, List, Literal, Optional, Union
 
 import pydantic
 from pydantic import BaseModel
@@ -184,6 +184,51 @@ class BaseResponse(BaseModel):
 
 class TaskVideoRequest(VideoParams, BaseModel):
     pass
+
+
+class BatchVideoItem(BaseModel):
+    """批量生成中的一个视频：主题必填；文案、关键词、风格可选（留空由 AI 生成 / 使用 settings 中的风格）"""
+
+    video_subject: str
+    video_script: Optional[str] = ""
+    video_terms: Optional[str] = ""
+    video_script_style: Optional[str] = ""
+
+
+class BatchVideoRequest(BaseModel):
+    """
+    {
+      "items": [
+        {"video_subject": "5 mẹo tiết kiệm tiền", "video_script_style": "educational"},
+        {"video_subject": "Bình giữ nhiệt inox 500ml", "video_script_style": "sales"}
+      ],
+      "settings": {"video_subject": "", "video_language": "vi-VN", "voice_name": "vi-VN-HoaiMyNeural-Female"},
+      "merge_videos": true,
+      "merge_transition": "crossfade"
+    }
+    """
+
+    items: List[BatchVideoItem] = pydantic.Field(..., min_length=1, max_length=200)
+    # 整批共用的设置（配音、字幕、素材来源等），与 /videos 接口的参数相同
+    settings: Optional[VideoParams] = None
+    merge_videos: bool = False
+    merge_transition: Literal["none", "crossfade"] = "none"
+
+
+class MergeVideoRequest(BaseModel):
+    """
+    {
+      "task_ids": ["<task_id 1>", "<task_id 2>"],
+      "video_files": ["tasks/<task_id>/final-1.mp4", "local_videos/intro.mp4"],
+      "transition": "crossfade"
+    }
+    task_ids 与 video_files 可同时使用，按先 task_ids 后 video_files 的顺序合并。
+    video_files 只能是 storage/tasks 或 storage/local_videos 目录下的文件。
+    """
+
+    task_ids: Optional[List[str]] = []
+    video_files: Optional[List[str]] = []
+    transition: Literal["none", "crossfade"] = "none"
 
 
 class TaskQueryRequest(BaseModel):

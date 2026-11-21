@@ -15,8 +15,11 @@ from app.controllers.manager.memory_manager import InMemoryTaskManager
 from app.controllers.manager.redis_manager import RedisTaskManager
 from app.controllers.v1.base import new_router
 from app.models.exception import HttpException
+from app.models import const
 from app.models.schema import (
     AudioRequest,
+    BatchVideoRequest,
+    MergeVideoRequest,
     BgmRetrieveResponse,
     BgmUploadResponse,
     SubtitleRequest,
@@ -28,6 +31,7 @@ from app.models.schema import (
     VideoMaterialUploadResponse,
     VideoMaterialRetrieveResponse
 )
+from app.services import batch as batch_service
 from app.services import state as sm
 from app.services import task as tm
 from app.utils import utils
@@ -141,6 +145,112 @@ def create_task(
             task_id=task_id, status_code=400, message=f"{request_id}: {str(e)}"
         )
 
+
+
+@router.post(
+    "/videos/batch",
+    response_model=TaskResponse,
+    summary="Generate multiple videos from a list of subjects (optionally merge them)",
+)
+def create_batch_videos(request: Request, body: BatchVideoRequest):
+    task_id = utils.get_uuid()
+    request_id = base.get_task_id(request)
+    base_params = body.settings or TaskVideoRequest(video_subject="")
+    items = [
+        batch_service.BatchItem(
+            subject=item.video_subject.strip(),
+            script=item.video_script or "",
+            keywords=item.video_terms or "",
+            style=item.video_script_style or "",
+        )
+        for item in body.items
+        if item.video_subject and item.video_subject.strip()
+    ]
+    if not items:
+        raise HttpException(
+            task_id=task_id, status_code=400, message=f"{request_id}: no valid subjects"
+        )
+    sm.state.update_task(task_id, total=len(items))
+    task_manager.add_task(
+        batch_service.run_batch_task,
+        task_id=task_id,
+        items=items,
+        base_params=base_params,
+        merge_videos=body.merge_videos,
+        merge_transition=body.merge_transition,
+    )
+    logger.success(f"Batch task created: {task_id}, {len(items)} videos")
+    return utils.get_response(200, {"task_id": task_id})
+
+
+def _resolve_merge_input(video_file: str, request_id: str) -> str:
+    # 只允许合并任务输出（storage/tasks）和已上传素材（storage/local_videos）中的文件，
+    # 防止通过该接口读取服务器上的任意文件
+    path = (video_file or "").strip()
+    if "://" in path:
+        # 支持直接传入 GET /tasks/{task_id} 返回的视频地址
+        marker = "/tasks/"
+        if marker not in path:
+            raise HttpException(
+                task_id=request_id, status_code=400, message=f"{request_id}: invalid video url"
+            )
+        path = os.path.join("tasks", path.split(marker, 1)[1])
+    storage_dir = utils.storage_dir()
+    if not os.path.isabs(path):
+        path = os.path.join(storage_dir, path)
+    for allowed_dir in (utils.task_dir(), utils.storage_dir("local_videos", create=True)):
+        allowed_real = os.path.realpath(allowed_dir)
+        try:
+            inside = os.path.commonpath([allowed_real, os.path.realpath(path)]) == allowed_real
+        except ValueError:
+            # Windows 上不同盘符的路径无法比较，视为不在允许目录内
+            inside = False
+        if inside:
+            return _resolve_path_within_directory(
+                allowed_dir, os.path.relpath(os.path.realpath(path), allowed_real), request_id
+            )
+    raise HttpException(
+        task_id=request_id,
+        status_code=403,
+        message=f"{request_id}: only files in storage/tasks or storage/local_videos can be merged",
+    )
+
+
+@router.post(
+    "/videos/merge",
+    response_model=TaskResponse,
+    summary="Merge several generated videos into one (straight cut or crossfade)",
+)
+def merge_videos(request: Request, body: MergeVideoRequest):
+    request_id = base.get_task_id(request)
+    files = []
+    for source_task_id in body.task_ids or []:
+        task = sm.state.get_task(source_task_id)
+        if not task or task.get("state") != const.TASK_STATE_COMPLETE or not task.get("videos"):
+            raise HttpException(
+                task_id=request_id,
+                status_code=400,
+                message=f"{request_id}: task {source_task_id} not found or has no finished videos",
+            )
+        files.extend(_resolve_merge_input(v, request_id) for v in task["videos"])
+    for video_file in body.video_files or []:
+        files.append(_resolve_merge_input(video_file, request_id))
+    if len(files) < 2:
+        raise HttpException(
+            task_id=request_id,
+            status_code=400,
+            message=f"{request_id}: at least two videos are required",
+        )
+
+    task_id = utils.get_uuid()
+    sm.state.update_task(task_id)
+    task_manager.add_task(
+        batch_service.run_merge_task, task_id=task_id, files=files, transition=body.transition
+    )
+    logger.success(f"Merge task created: {task_id}, {len(files)} videos")
+    return utils.get_response(200, {"task_id": task_id})
+
+
 from fastapi import Query
 
 @router.get("/tasks", response_model=TaskQueryResponse, summary="Get all tasks")
@@ -174,6 +284,8 @@ def get_task(
     request_id = base.get_task_id(request)
     task = sm.state.get_task(task_id)
     if task:
+        # 复制一份再转换为 URL，避免内存状态中保存的文件路径被改写成 URL
+        task = dict(task)
         task_dir = utils.task_dir()
 
         def file_to_uri(file):
@@ -196,6 +308,17 @@ def get_task(
             for v in combined_videos:
                 urls.append(file_to_uri(v))
             task["combined_videos"] = urls
+        # 批量生成 / 合并任务的结果文件
+        for key in ("merged_video", "csv_file"):
+            if task.get(key):
+                task[key] = file_to_uri(task[key])
+        if isinstance(task.get("results"), list):
+            task["results"] = [
+                {**r, "videos": [file_to_uri(v) for v in r.get("videos", [])]}
+                if isinstance(r, dict)
+                else r
+                for r in task["results"]
+            ]
         return utils.get_response(200, task)
 
     raise HttpException(

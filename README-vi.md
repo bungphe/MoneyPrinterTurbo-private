@@ -111,6 +111,46 @@ Trên giao diện Web, mở mục **Tạo Hàng Loạt** (phía trên nút **T�
 > Lưu ý: các nền tảng (YouTube, TikTok) không trả tiền cho nội dung sản xuất hàng loạt theo khuôn mẫu, ít giá trị.
 > Hãy kiểm tra lại nội dung, thêm góc nhìn riêng, và gắn nhãn nội dung do AI tạo theo quy định của từng nền tảng.
 
+## API tạo hàng loạt & ghép video 🔌
+
+Chạy API bằng `python main.py` (tài liệu đầy đủ ở `http://127.0.0.1:8080/docs`). Cả hai API chạy nền và trả về
+`task_id` ngay; theo dõi bằng `GET /api/v1/tasks/{task_id}` (`state`: `4` đang chạy, `1` xong, `-1` lỗi; `progress`: %).
+
+**Tạo hàng loạt** — `POST /api/v1/videos/batch`:
+
+```bash
+curl -X POST http://127.0.0.1:8080/api/v1/videos/batch -H "Content-Type: application/json" -d '{
+  "items": [
+    {"video_subject": "5 mẹo tiết kiệm tiền mỗi tháng", "video_script_style": "educational"},
+    {"video_subject": "Bình giữ nhiệt inox 500ml giữ lạnh 12 tiếng", "video_script_style": "sales"}
+  ],
+  "settings": {"video_subject": "", "video_language": "vi-VN", "voice_name": "vi-VN-HoaiMyNeural-Female",
+               "video_aspect": "9:16", "paragraph_number": 1},
+  "merge_videos": true,
+  "merge_transition": "crossfade"
+}'
+```
+
+- `items`: mỗi video một chủ đề; `video_script`, `video_terms`, `video_script_style` tùy chọn (tối đa 200 video/lô).
+- `settings`: cài đặt chung cho cả lô, giống tham số của `POST /api/v1/videos`.
+- Kết quả trong `GET /api/v1/tasks/{task_id}`: `results` (từng video: `status`, `videos`, `title`, `hashtags`, `error`),
+  `videos`, `merged_video` (nếu bật `merge_videos`), `csv_file` — đều là link tải được.
+
+**Ghép video** — `POST /api/v1/videos/merge`:
+
+```bash
+curl -X POST http://127.0.0.1:8080/api/v1/videos/merge -H "Content-Type: application/json" -d '{
+  "task_ids": ["<task_id video 1>", "<task_id video 2>"],
+  "video_files": ["local_videos/outro.mp4"],
+  "transition": "none"
+}'
+```
+
+- `task_ids`: ghép video của các task đã xong; `video_files`: đường dẫn trong `storage/tasks` hoặc `storage/local_videos`
+  (tải file lên bằng `POST /api/v1/video_materials`), hoặc link do API trả về. Ghép theo thứ tự `task_ids` rồi `video_files`.
+- Vì an toàn, API **không** nhận file nằm ngoài hai thư mục trên (trả lỗi 403).
+- `transition`: `none` (cắt thẳng) hoặc `crossfade` (hòa cảnh). Kết quả: `videos[0]` trong `GET /api/v1/tasks/{task_id}`.
+
 ## Video minh họa 📺
 
 ### Dọc 9:16
